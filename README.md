@@ -1,0 +1,2 @@
+# multinode_parallism_of_Moe
+东南大学srtp，多节点Moe模型并行策略研究
