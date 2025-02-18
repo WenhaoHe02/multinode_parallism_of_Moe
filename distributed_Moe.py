@@ -1,66 +1,120 @@
 import torch
 from torch import nn
-
+import torch.nn.functional as F
 from llama2_and_deepseek_Moe import MoeConfig, MoeRouter, BasicExpert
 import torch.distributed as dist
-
+import time
 from run_distributed_Moe import DistConfig
 
+class _AllToAll():
+    @staticmethod
+    def forward(group: dist.ProcessGroup, input: torch.Tensor) -> torch.Tensor:  # type: ignore
+        input = input.contiguous()
+        output = torch.empty_like(input)
+        if torch.distributed.is_initialized():
+            dist.all_to_all_single(output, input, group=group)
+        else:
+            assert group is None
+            output = input
+        return output
+def get_fused_cumsum_sub_one():
+    return lambda mask: torch.cumsum(mask, dim=0) - 1
 
-class SparseMoe(nn.Module):
+def all_to_all_wrapper(self, input: torch.Tensor):
+    cuda_start = torch.cuda.Event(enable_timing=True)
+    cuda_end = torch.cuda.Event(enable_timing=True)
+    cpu_start = time.time() * 1000
+    cuda_start.record()
+    output = _AllToAll.forward(self.all2all_group, input)
+    cuda_end.record()
+    cpu_end = time.time() * 1000
+    return output
+
+def get_all2all_group(expert_num:int):
+    if torch.distributed.is_initialized():
+        world_size = dist.get_world_size()
+        assert world_size <= expert_num
+        assert expert_num % world_size == 0
+        all2all_groups_list = [[i for i in range(world_size)]]
+
+
+        _all2all_group_idx = all2all_groups_list
+        _all2all_groups = [
+            dist.new_group(g) for g in all2all_groups_list
+        ]
+
+        my_group_idx = _find_my_group_index(_all2all_group_idx)
+        return _all2all_groups[my_group_idx]
+
+def _find_my_group_index(grouped_ranks):
+    my_rank = torch.distributed.get_rank()
+    for i, group in enumerate(grouped_ranks):
+        if my_rank in group:
+            return i
+    raise RuntimeError
+
+
+class DistSparseMoe(nn.Module):
     def __init__(self, config: MoeConfig, dist_config: DistConfig):
         super().__init__()
         self.config = config
         self.topk = config.topk
         self.hidden_dim = config.hidden_dim
         self.expert_num = config.expert_num
-        self.experts = nn.ModuleList(
-            BasicExpert(
-                config.hidden_dim,
-                config.hidden_dim,
-            ).to(device=torch.device(f'cuda:{i % dist_config.world_size}'), dtype=torch.bfloat16) for i in range(config.expert_num)
-        )
-        self.router = MoeRouter(config).to(dist.get_rank(), dtype= torch.bfloat16)
+        self.experts = nn.ModuleList(BasicExpert(config.hidden_dim, config.hidden_dim))
+        self.router = MoeRouter(config)
+        self.capacity_factor = dist_config.capacity_factor
+        self.all2all_group = get_all2all_group(self.expert_num)
+        self.all2all_size = dist.get_world_size()
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
+        capacity = batch_size * seq_len // self.expert_num * self.capacity_factor
         hidden_states = x.view(-1, hidden_dim)
         router_logits, router_weights, selected_experts_indices, expert_mask = self.router(hidden_states)
-        final_hidden_states = torch.zeros(
-            (batch_size * seq_len, hidden_dim),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device
+        expert_layer = self.experts
+        normalized_logits = F.softmax(router_logits, dim=1)
+        index_of_best_expert = torch.argmax(normalized_logits, dim=1)
+        classified_expert_mask = F.one_hot(index_of_best_expert, num_classes=self.expert_num).unsqueeze(-1)
+        normalized_logits_sum = (normalized_logits * classified_expert_mask).sum(dim=1)
+        locations = get_fused_cumsum_sub_one()(classified_expert_mask)
+        classified_expert_mask = classified_expert_mask * torch.lt(locations, capacity).float()
+        locations_sum = torch.sum(locations * classified_expert_mask, dim=1)
+        new_normalized_logits = normalized_logits_sum.unsqueeze(-1) * classified_expert_mask.to(normalized_logits_sum.dtype)  # einsum("s,se->se")
+        classified_location = F.one_hot(locations_sum, num_classes=capacity).unsqueeze(-1)
+        combine_weight = torch.bmm(
+            # einsum("se,sc->sec")
+            new_normalized_logits.unsqueeze(-1),
+            classified_location.to(new_normalized_logits).unsqueeze(1),
         )
-        for expert_idx in range(self.expert_num):
-            expert_layer = self.experts[expert_idx]
-            # expert_mask[expert_idx] shape 是 (top_k, b * s)
-            idx, top_x = torch.where(expert_mask[expert_idx])
-            # idx 和 top_x 都是一维 tensor
-            # idx 的值是 0 或 1, 表示这个 token 是作为当前专家的 top1 还是 top2
-            # top_x 的值是 token 在 batch*seq_len 中的位置索引
-            # 例如对于 batch_size=2, seq_len=4 的输入:
-            # top_x 的值范围是 0-7, 表示在展平后的 8 个 token 中的位置
-            # idx 的值是 0/1, 表示这个 token 把当前专家作为其 top1/top2 专家
-
-            # hidden_states 的 shape 是 (bs * seq_len, hidden_dim)
-            # 需要取到 top_x 对应的 hidden_states
-            current_state = hidden_states.unsqueeze(
-                0
-            )[:, top_x, :].reshape(-1, hidden_dim)  # （selected_token_number, hidden_dim）
-
-            # router_weight 的 shape 是 (b * s, top_k)
-            current_hidden_states = expert_layer(
-                current_state
-            ) * router_weights[top_x, idx].unsqueeze(-1)  # （selected_token_number, 1） 这里有广播
-
-            # 把当前专家的输出加到 final_hidden_states 中
-            # 方式1 的写法性能更好，并且方式1容易出现
-            final_hidden_states.index_add_(0, top_x, current_hidden_states.to(hidden_states.dtype))
-            # 方式2
-            # final_hidden_states[top_x] += current_hidden_states.to(hidden_states.dtype)
-            # 方式2 的写法性能更差，并且方式2容易出现错误，+= 操作在处理重复索引时需要多次读写内存，可能会导致竞争条件
-
-            # 把 final_hidden_states 还原到原来的 shape
-        final_hidden_states = final_hidden_states.reshape(batch_size, seq_len, hidden_dim)
-
-        return final_hidden_states, router_logits  # shape 是 (b * s, expert_number)
+        dispatch_mask = combine_weight.bool()
+        dispatch_mask = dispatch_mask.to(hidden_states.dtype).permute(
+            1, 2, 0
+        )  # S,E,C -> E,C,S
+        # E, C, S = dispatch_mask.size()
+        dispatched_input = torch.mm(
+            dispatch_mask.view(self.expert_num * capacity, batch_size * seq_len), hidden_states
+        )  # -> (E*C),M
+        dispatched_input = all_to_all_wrapper(dispatched_input)
+        dispatched_input = dispatched_input.reshape(
+            self.all2all_size, 1, -1, hidden_dim
+        ) # 1是local expert数量
+        chunks = dispatched_input.chunk(1, dim=1) # 1是local expert数量
+        expert_outputs = []
+        for chunk, expert in zip(chunks, self.experts):
+            expert_outputs += [expert(chunk)]
+        expert_output = torch.cat(expert_outputs, dim=1)
+        expert_output = all_to_all_wrapper(expert_output)
+        # Re-shape back: gecm -> ecm
+        expert_output = expert_output.reshape(
+            self.all2all_size * 1, -1, hidden_dim
+        ) # 1是local expert
+        # einsum("sec,ecm->sm")
+        combined_output = combine_weight.view(batch_size * seq_len, self.expert_num * capacity).mm(
+            expert_output.view(self.expert_num * capacity, self.hidden_dim)
+        )
+        # Remove padding here when --max-tokens is specified and not --batch-size or --max-sentences
+        combined_output = combined_output[ : batch_size * seq_len, :]
+        combined_output = combined_output.reshape(batch_size, seq_len, hidden_dim)
+        combined_output = combined_output[: batch_size, :, :]
+        return combined_output

@@ -1,18 +1,15 @@
 import math
-
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-import numpy as np
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
 from dataclasses import dataclass
+from typing import *
 
-torch.manual_seed(1024)
+torch.manual_seed(11)
+
 
 @dataclass
-class GPTConfig:
+class LlamaConfig:
     max_seq: int = 512
     batch_size: int = 12
     n_layer: int = 12
@@ -22,7 +19,7 @@ class GPTConfig:
     head_size: int = hidden_dim // n_head
     vocab_size: int = 50257
 class SingleHeadAttention(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.key = nn.Linear(config.hidden_dim, config.head_size)
         self.value = nn.Linear(config.hidden_dim, config.head_size)
@@ -44,7 +41,7 @@ class SingleHeadAttention(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.heads = nn.ModuleList(
             [
@@ -65,7 +62,7 @@ class MultiHeadAttention(nn.Module):
         return output
 
 class MLP(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(config.hidden_dim, 4 * config.hidden_dim),
@@ -78,7 +75,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 class Block(nn.Module):
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.att = MultiHeadAttention(config)
         self.mlp = MLP(config)
@@ -89,8 +86,8 @@ class Block(nn.Module):
         x = x + self.att(self.rn1(x))
         x = x + self.mlp(self.rn2(x))
         return x
-class GPT(nn.Module):
-    def __init__(self, config: GPTConfig):
+class Llama(nn.Module):
+    def __init__(self, config: LlamaConfig):
         super().__init__()
         self.token_embd_table = nn.Embedding(config.vocab_size, config.hidden_dim)
         self.position_embd_table = nn.Embedding(config.max_seq, config. hidden_dim)
@@ -171,6 +168,7 @@ class BasicMoe(nn.Module):
         output = expert_weights @ expert_output
         return  output.squeeze(1)
 
+
 class MoeConfig:
     def __init__(self, hidden_dim, expert_num, topk, shared_expert_num=2):
         self.hidden_dim = hidden_dim
@@ -179,14 +177,14 @@ class MoeConfig:
         self.shared_expert_num = shared_expert_num
 
 
-class MoeRouter(nn.Module):
+class MoeRouter(nn.Module) :
     def __init__(self, config: MoeConfig):
         super().__init__()
         self.gate = nn.Linear(config.hidden_dim, config.expert_num)
         self.expert_num = config.expert_num
         self.top_k = config.topk
 
-    def forward(self, x):
+    def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(x)
         # router_logits[bs*seq_len, expert_num]
         router_probs = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -241,6 +239,7 @@ class SparseMoe(nn.Module):
             expert_layer = self.experts[expert_idx]
             # expert_mask[expert_idx] shape 是 (top_k, b * s)
             idx, top_x = torch.where(expert_mask[expert_idx])
+            print("expert mask:{}", expert_mask.shape)
             # idx 和 top_x 都是一维 tensor
             # idx 的值是 0 或 1, 表示这个 token 是作为当前专家的 top1 还是 top2
             # top_x 的值是 token 在 batch*seq_len 中的位置索引
@@ -250,6 +249,8 @@ class SparseMoe(nn.Module):
 
             # hidden_states 的 shape 是 (bs * seq_len, hidden_dim)
             # 需要取到 top_x 对应的 hidden_states
+            print(f"topx_shape: {top_x.shape}")
+            print(f"topx: {top_x}")
             current_state = hidden_states.unsqueeze(
                 0
             )[:, top_x, :].reshape(-1, hidden_dim)  # （selected_token_number, hidden_dim）
@@ -306,7 +307,7 @@ class ShareExpertMOE(nn.Module):
 
 def test_share_expert_moe():
     x = torch.rand(2, 4, 16)
-    config = MoeConfig(16, 2, 2)
+    config = MoeConfig(16, 4, 2)
     share_expert_moe = ShareExpertMOE(config)
     out = share_expert_moe(x)
     print(out[0].shape, out[1].shape)
@@ -315,10 +316,10 @@ def test_share_expert_moe():
 test_share_expert_moe()
 
 
-config = GPTConfig()
+config = LlamaConfig()
 
 
-model = GPT(config)
+model = Llama(config)
 
 
 batch_size = config.batch_size

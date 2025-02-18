@@ -9,6 +9,7 @@ class DistConfig:
     world_size: int = 1
     backend: str = 'nccl'
     device = None
+    capacity_factor: 0.5
 
 
 def init_dist(dist_config: DistConfig):
