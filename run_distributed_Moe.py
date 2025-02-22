@@ -2,15 +2,13 @@ import os
 import time
 
 import torch
-from llama2_and_deepseek_Moe import MoeConfig, ShareExpertMOE
+# from llama2_and_deepseek_Moe import ShareExptMOE
+from Config import MoeConfig, DistConfig
+from distributed_Moe import DistShareExpertMOE
 import torch.distributed as dist
 
 
-class DistConfig:
-    world_size: int = 1
-    backend: str = "nccl"
-    device = None
-    capacity_factor = 0.5
+
 
 
 def init_dist(dist_config: DistConfig):
@@ -27,7 +25,7 @@ def run_distributed_share_expert_moe(warmup: int, runs: int):
     dist_config = DistConfig()
     dist_config.world_size = 3
     init_dist(dist_config)
-    share_expert_moe = ShareExpertMOE(config)
+    share_expert_moe = DistShareExpertMOE(config, dist_config)
     share_expert_moe = share_expert_moe.to(device=dist_config.device, dtype=torch.bfloat16)
     x = x.to(device=dist_config.device, dtype=torch.bfloat16)
     share_expert_moe.eval()
