@@ -5,6 +5,9 @@ import torch
 from dataclasses import dataclass
 from typing import *
 
+import distributed_Moe as distmoe
+from config import MoeConfig
+
 torch.manual_seed(11)
 
 
@@ -166,14 +169,6 @@ class BasicMoe(nn.Module):
         return output.squeeze(1)
 
 
-class MoeConfig:
-    def __init__(self, hidden_dim, expert_num, topk, shared_expert_num=2):
-        self.hidden_dim = hidden_dim
-        self.expert_num = expert_num
-        self.topk = topk
-        self.shared_expert_num = shared_expert_num
-
-
 class MoeRouter(nn.Module):
     def __init__(self, config: MoeConfig):
         super().__init__()
@@ -303,7 +298,8 @@ class ShareExpertMOE(nn.Module):
 def test_share_expert_moe():
     x = torch.rand(2, 4, 16)
     config = MoeConfig(16, 4, 2)
-    share_expert_moe = ShareExpertMOE(config)
+    # share_expert_moe = ShareExpertMOE(config)
+    share_expert_moe = distmoe.DistSparseMoe(config, distmoe.DistConfig())
     out = share_expert_moe(x)
     print(out[0].shape, out[1].shape)
 
