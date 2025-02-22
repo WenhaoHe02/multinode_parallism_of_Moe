@@ -4,7 +4,7 @@ import time
 import torch
 # from llama2_and_deepseek_Moe import ShareExptMOE
 from config import MoeConfig, DistConfig
-from distributed_Moe import DistShareExpertMOE
+from optimized_distributed_Moe import DistShareExpertMOE
 import torch.distributed as dist
 
 

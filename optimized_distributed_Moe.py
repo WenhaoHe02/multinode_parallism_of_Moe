@@ -6,48 +6,50 @@ import torch.distributed as dist
 import time
 from config import DistConfig, MoeConfig
 
-class _AllToAll():
+
+class _AllToAll:
     @staticmethod
-    def forward(group: dist.ProcessGroup, input: torch.Tensor) -> torch.Tensor:  # type: ignore
+    def forward(input: torch.Tensor) -> torch.Tensor:  # type: ignore
         input = input.contiguous()
         output = torch.empty_like(input)
-        if torch.distributed.is_initialized():
-            dist.all_to_all_single(output, input, group=group)
+        if dist.is_initialized():
+            dist.all_to_all_single(output, input)
         else:
-            assert group is None
             output = input
         return output
+
+
 def get_fused_cumsum_sub_one():
     return lambda mask: torch.cumsum(mask, dim=0) - 1
 
-def all_to_all_wrapper(self, input: torch.Tensor):
+
+def all_to_all_wrapper(input: torch.Tensor):
     cuda_start = torch.cuda.Event(enable_timing=True)
     cuda_end = torch.cuda.Event(enable_timing=True)
     cpu_start = time.time() * 1000
     cuda_start.record()
-    output = _AllToAll.forward(self.all2all_group, input)
+    output = _AllToAll.forward(input)
     cuda_end.record()
     cpu_end = time.time() * 1000
     return output
 
-def get_all2all_group(expert_num:int):
-    if torch.distributed.is_initialized():
+
+def get_all2all_group(expert_num: int):
+    if dist.is_initialized():
         world_size = dist.get_world_size()
         assert world_size <= expert_num
         assert expert_num % world_size == 0
         all2all_groups_list = [[i for i in range(world_size)]]
 
-
         _all2all_group_idx = all2all_groups_list
-        _all2all_groups = [
-            dist.new_group(g) for g in all2all_groups_list
-        ]
+        _all2all_groups = [dist.new_group(g) for g in all2all_groups_list]
 
         my_group_idx = _find_my_group_index(_all2all_group_idx)
         return _all2all_groups[my_group_idx]
 
+
 def _find_my_group_index(grouped_ranks):
-    my_rank = torch.distributed.get_rank()
+    my_rank = dist.get_rank()
     for i, group in enumerate(grouped_ranks):
         if my_rank in group:
             return i
@@ -61,7 +63,7 @@ class DistSparseMoe(nn.Module):
         self.topk = config.topk
         self.hidden_dim = config.hidden_dim
         self.expert_num = config.expert_num
-        self.experts = nn.ModuleList(BasicExpert(config.hidden_dim, config.hidden_dim))
+        self.experts = nn.ModuleList([BasicExpert(config.hidden_dim, config.hidden_dim)])
         self.router = MoeRouter(config)
         self.capacity_factor = dist_config.capacity_factor
         self.all2all_group = get_all2all_group(self.expert_num)
@@ -71,36 +73,70 @@ class DistSparseMoe(nn.Module):
         batch_size, seq_len, hidden_dim = x.size()
         capacity = batch_size * seq_len // self.expert_num * self.capacity_factor
         hidden_states = x.view(-1, hidden_dim)
-        router_logits, router_weights, selected_experts_indices, expert_mask = self.router(hidden_states)
+        router_logits, router_weights, selected_experts_indices, expert_mask = (
+            self.router(hidden_states)
+        )
         expert_layer = self.experts
         normalized_logits = F.softmax(router_logits, dim=1)
         index_of_best_expert = torch.argmax(normalized_logits, dim=1)
         optimal_index = torch.argsort(index_of_best_expert)
-        sorted_decision = index_of_best_expert[optimal_index] # indexing,并行执行
-        _, size_list = torch.unique(sorted_decision, sorted=False, return_counts=True)
-        recv_sizes = all_to_all_wrapper(size_list) #计算隐藏延迟
-        send_chunks = torch.split(hidden_states, size_list)
+        sorted_decision = index_of_best_expert[optimal_index]  # indexing,并行执行
+        # TODO
+        output, size_list = torch.unique(sorted_decision, sorted=False, return_counts=True)
+        print(f"output: {output}, shape: {output.shape}")
+        recv_sizes = all_to_all_wrapper(size_list)  # 计算隐藏延迟
+        print(f"size_list: {size_list}")
+        send_chunks = torch.split(hidden_states, list(size_list))
         token_size = recv_sizes.sum()
-        recv_tokens = torch.zeros(token_size, hidden_dim)
+        print(f"send_chunks: {send_chunks}, shape: {send_chunks[2].shape}")
+        recv_tokens = [torch.zeros(int(recv_sizes[i].item()), hidden_dim) for i in range(self.all2all_size)]
         dist.all_to_all(recv_tokens, send_chunks)
         expert_outputs = torch.zeros(token_size, hidden_dim)
         for chunk, expert in zip(recv_tokens, self.experts):
             expert_outputs += [expert(chunk)]
         expert_output = torch.cat(expert_outputs, dim=0)
+        print(f"expert_output {expert_output}, shape: {expert_output.shape}")
         expert_output = all_to_all_wrapper(self.all2all_group, expert_output)
         # Re-shape back: gecm -> ecm
         expert_output = expert_output.reshape(
             self.all2all_size * 1, -1, hidden_dim
-        ) # 1是local expert
+        )  # 1是local expert
         # einsum("sec,ecm->sm")
-        combined_output = combine_weight.view(batch_size * seq_len, self.expert_num * capacity).mm(
-            expert_output.view(self.expert_num * capacity, self.hidden_dim)
-        )
+        combined_output = combine_weight.view(
+            batch_size * seq_len, self.expert_num * capacity
+        ).mm(expert_output.view(self.expert_num * capacity, self.hidden_dim))
         # Remove padding here when --max-tokens is specified and not --batch-size or --max-sentences
-        combined_output = combined_output[ : batch_size * seq_len, :]
+        combined_output = combined_output[: batch_size * seq_len, :]
         combined_output = combined_output.reshape(batch_size, seq_len, hidden_dim)
-        combined_output = combined_output[: batch_size, :, :]
-
-
+        combined_output = combined_output[:batch_size, :, :]
 
         return expert_output
+
+
+class DistShareExpertMOE(nn.Module):
+    def __init__(self, config, dist_config: DistConfig):
+        super().__init__()
+
+        self.moe_model = DistSparseMoe(config, dist_config)
+        self.shared_experts = nn.ModuleList(
+            [
+                BasicExpert(config.hidden_dim, config.hidden_dim)
+                for _ in range(config.shared_expert_num)
+            ]
+        )
+
+    def forward(self, x):
+        # x shape 是 (b, s, hidden_dim)
+        # 首先过 moe 模型
+        sparse_moe_out, router_logits = self.moe_model(x)
+
+        # 针对的还是 x 的每一个
+        # 然后过 shared experts
+        shared_experts_out = [
+            expert(x) for expert in self.shared_experts
+        ]  # 每一个 expert 的输出 shape 是 (b, s, hidden_dim)
+
+        shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
+
+        # 把 sparse_moe_out 和 shared_experts_out 加起来
+        return sparse_moe_out + shared_experts_out, router_logits
