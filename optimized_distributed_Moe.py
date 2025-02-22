@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from llama2_and_deepseek_Moe import MoeRouter, BasicExpert
 import torch.distributed as dist
 import time
-from Config import DistConfig, MoeConfig
+from config import DistConfig, MoeConfig
 
 class _AllToAll():
     @staticmethod

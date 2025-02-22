@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch
 from typing import *
 
-from Config import LlamaConfig, MoeConfig
+from config import LlamaConfig, MoeConfig
 
 torch.manual_seed(11)
 

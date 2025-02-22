@@ -3,7 +3,7 @@ import time
 
 import torch
 # from llama2_and_deepseek_Moe import ShareExptMOE
-from Config import MoeConfig, DistConfig
+from config import MoeConfig, DistConfig
 from distributed_Moe import DistShareExpertMOE
 import torch.distributed as dist
 
@@ -21,7 +21,7 @@ def init_dist(dist_config: DistConfig):
 
 def run_distributed_share_expert_moe(warmup: int, runs: int):
     x = torch.rand(2, 4, 16)
-    config = MoeConfig(16, 2, 2)
+    config = MoeConfig(16, 3, 2)
     dist_config = DistConfig()
     dist_config.world_size = 3
     init_dist(dist_config)

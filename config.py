@@ -13,7 +13,7 @@ class DistConfig:
     world_size: int = 1
     backend: str = "nccl"
     device = None
-    capacity_factor = 0.5
+    capacity_factor = 3
 
 @dataclass
 class LlamaConfig:

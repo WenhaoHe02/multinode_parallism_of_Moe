@@ -4,9 +4,10 @@ import torch.nn.functional as F
 from llama2_and_deepseek_Moe import MoeRouter, BasicExpert
 import torch.distributed as dist
 import time
-from Config import DistConfig, MoeConfig
+from config import DistConfig, MoeConfig
 
-class _AllToAll():
+
+class _AllToAll:
     @staticmethod
     def forward(group: dist.ProcessGroup, input: torch.Tensor) -> torch.Tensor:  # type: ignore
         input = input.contiguous()
@@ -17,8 +18,11 @@ class _AllToAll():
             assert group is None
             output = input
         return output
+
+
 def get_fused_cumsum_sub_one():
     return lambda mask: torch.cumsum(mask, dim=0) - 1
+
 
 def all_to_all_wrapper(all2all_group: dist.ProcessGroup, input: torch.Tensor):
     cuda_start = torch.cuda.Event(enable_timing=True)
@@ -30,21 +34,20 @@ def all_to_all_wrapper(all2all_group: dist.ProcessGroup, input: torch.Tensor):
     cpu_end = time.time() * 1000
     return output
 
-def get_all2all_group(expert_num:int):
+
+def get_all2all_group(expert_num: int):
     if torch.distributed.is_initialized():
         world_size = dist.get_world_size()
         assert world_size <= expert_num
         assert expert_num % world_size == 0
         all2all_groups_list = [[i for i in range(world_size)]]
 
-
         _all2all_group_idx = all2all_groups_list
-        _all2all_groups = [
-            dist.new_group(g) for g in all2all_groups_list
-        ]
+        _all2all_groups = [dist.new_group(g) for g in all2all_groups_list]
 
         my_group_idx = _find_my_group_index(_all2all_group_idx)
         return _all2all_groups[my_group_idx]
+
 
 def _find_my_group_index(grouped_ranks):
     my_rank = torch.distributed.get_rank()
@@ -61,7 +64,9 @@ class DistSparseMoe(nn.Module):
         self.topk = config.topk
         self.hidden_dim = config.hidden_dim
         self.expert_num = config.expert_num
-        self.experts = nn.ModuleList(BasicExpert(config.hidden_dim, config.hidden_dim))
+        self.experts = nn.ModuleList(
+            [BasicExpert(config.hidden_dim, config.hidden_dim)]
+        )
         self.router = MoeRouter(config)
         self.capacity_factor = dist_config.capacity_factor
         self.all2all_group = get_all2all_group(self.expert_num)
@@ -69,19 +74,47 @@ class DistSparseMoe(nn.Module):
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
-        capacity = batch_size * seq_len // self.expert_num * self.capacity_factor
+        capacity = int(batch_size * seq_len // self.expert_num * self.capacity_factor)
         hidden_states = x.view(-1, hidden_dim)
-        router_logits, router_weights, selected_experts_indices, expert_mask = self.router(hidden_states)
+        router_logits, router_weights, selected_experts_indices, expert_mask = (
+            self.router(hidden_states)
+        )
+        print(f"router_logits: {router_logits}, shape: {router_logits.shape}")
         expert_layer = self.experts
         normalized_logits = F.softmax(router_logits, dim=1)
         index_of_best_expert = torch.argmax(normalized_logits, dim=1)
-        classified_expert_mask = F.one_hot(index_of_best_expert, num_classes=self.expert_num).unsqueeze(-1)
+        classified_expert_mask = F.one_hot(
+            index_of_best_expert, num_classes=self.expert_num
+        )
+        print(
+            f"normalized_logits: {normalized_logits}, shape: {normalized_logits.shape}"
+        )
+        print(
+            f"classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
+        )
         normalized_logits_sum = (normalized_logits * classified_expert_mask).sum(dim=1)
         locations = get_fused_cumsum_sub_one()(classified_expert_mask)
-        classified_expert_mask = classified_expert_mask * torch.lt(locations, capacity).float()
-        locations_sum = torch.sum(locations * classified_expert_mask, dim=1)
-        new_normalized_logits = normalized_logits_sum.unsqueeze(-1) * classified_expert_mask.to(normalized_logits_sum.dtype)  # einsum("s,se->se")
-        classified_location = F.one_hot(locations_sum, num_classes=capacity).unsqueeze(-1)
+        print(f"locations: {locations}, shape: {locations.shape}")
+
+        print(
+            f"before classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
+        )
+        classified_expert_mask = (
+            classified_expert_mask * torch.lt(locations, capacity).float()
+        )
+        print(
+            f"after classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
+        )
+        locations_sum = torch.sum(
+            locations * classified_expert_mask, dim=1, dtype=torch.int64
+        )
+        new_normalized_logits = normalized_logits_sum.unsqueeze(
+            -1
+        ) * classified_expert_mask.to(
+            normalized_logits_sum.dtype
+        )  # einsum("s,se->se")
+        print(f"locations_sum: {locations_sum}, shape: {locations_sum.shape}")
+        classified_location = F.one_hot(locations_sum, num_classes=capacity)
         combine_weight = torch.bmm(
             # einsum("se,sc->sec")
             new_normalized_logits.unsqueeze(-1),
@@ -93,31 +126,35 @@ class DistSparseMoe(nn.Module):
         )  # S,E,C -> E,C,S
         # E, C, S = dispatch_mask.size()
         dispatched_input = torch.mm(
-            dispatch_mask.view(self.expert_num * capacity, batch_size * seq_len), hidden_states
+            dispatch_mask.view(self.expert_num * capacity, batch_size * seq_len),
+            hidden_states,
         )  # -> (E*C),M
         dispatched_input = all_to_all_wrapper(self.all2all_group, dispatched_input)
         dispatched_input = dispatched_input.reshape(
             self.all2all_size, 1, -1, hidden_dim
-        ) # 1是local expert数量
-        chunks = dispatched_input.chunk(1, dim=1) # 1是local expert数量
+        )  # 1是local expert数量
+        chunks = dispatched_input.chunk(1, dim=1)  # 1是local expert数量
         expert_outputs = []
         for chunk, expert in zip(chunks, self.experts):
             expert_outputs += [expert(chunk)]
+        print(f"expert_outputs: {expert_outputs}")
         expert_output = torch.cat(expert_outputs, dim=1)
+        print(f"expert_output: {expert_output}, shape: {expert_output.shape}")
         expert_output = all_to_all_wrapper(self.all2all_group, expert_output)
         # Re-shape back: gecm -> ecm
         expert_output = expert_output.reshape(
             self.all2all_size * 1, -1, hidden_dim
-        ) # 1是local expert
+        )  # 1是local expert
         # einsum("sec,ecm->sm")
-        combined_output = combine_weight.view(batch_size * seq_len, self.expert_num * capacity).mm(
-            expert_output.view(self.expert_num * capacity, self.hidden_dim)
-        )
+        combined_output = combine_weight.view(
+            batch_size * seq_len, self.expert_num * capacity
+        ).mm(expert_output.view(self.expert_num * capacity, self.hidden_dim))
         # Remove padding here when --max-tokens is specified and not --batch-size or --max-sentences
-        combined_output = combined_output[ : batch_size * seq_len, :]
+        combined_output = combined_output[: batch_size * seq_len, :]
         combined_output = combined_output.reshape(batch_size, seq_len, hidden_dim)
-        combined_output = combined_output[: batch_size, :, :]
+        combined_output = combined_output[:batch_size, :, :]
         return combined_output
+
 
 class DistShareExpertMOE(nn.Module):
     def __init__(self, config, dist_config: DistConfig):
