@@ -71,7 +71,6 @@ class DistSparseMoe(nn.Module):
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
-        capacity = batch_size * seq_len // self.expert_num * self.capacity_factor
         hidden_states = x.view(-1, hidden_dim)
         router_logits, router_weights, selected_experts_indices, expert_mask = (
             self.router(hidden_states)
@@ -81,9 +80,7 @@ class DistSparseMoe(nn.Module):
         index_of_best_expert = torch.argmax(normalized_logits, dim=1)
         optimal_index = torch.argsort(index_of_best_expert)
         sorted_decision = index_of_best_expert[optimal_index]  # indexing,并行执行
-        # TODO
-        output, size_list = torch.unique(sorted_decision, sorted=False, return_counts=True)
-        print(f"output: {output}, shape: {output.shape}")
+        size_list = torch.bincount(sorted_decision, minlength=self.expert_num)
         recv_sizes = all_to_all_wrapper(size_list)  # 计算隐藏延迟
         print(f"size_list: {size_list}")
         send_chunks = torch.split(hidden_states, list(size_list))
@@ -93,22 +90,19 @@ class DistSparseMoe(nn.Module):
         dist.all_to_all(recv_tokens, send_chunks)
         expert_outputs = torch.zeros(token_size, hidden_dim)
         for chunk, expert in zip(recv_tokens, self.experts):
-            expert_outputs += [expert(chunk)]
+            if chunk.size(0) > 0:
+                expert_outputs.append(expert(chunk))
         expert_output = torch.cat(expert_outputs, dim=0)
         print(f"expert_output {expert_output}, shape: {expert_output.shape}")
         expert_output = all_to_all_wrapper(self.all2all_group, expert_output)
-        # Re-shape back: gecm -> ecm
-        expert_output = expert_output.reshape(
-            self.all2all_size * 1, -1, hidden_dim
-        )  # 1是local expert
-        # einsum("sec,ecm->sm")
-        combined_output = combine_weight.view(
-            batch_size * seq_len, self.expert_num * capacity
-        ).mm(expert_output.view(self.expert_num * capacity, self.hidden_dim))
-        # Remove padding here when --max-tokens is specified and not --batch-size or --max-sentences
-        combined_output = combined_output[: batch_size * seq_len, :]
+        # TODO 还需要乘对应的概率矩阵，但不一定是在这个位置
+        combined_output = expert_output[:batch_size * seq_len, :]  # 去除可能的填充
         combined_output = combined_output.reshape(batch_size, seq_len, hidden_dim)
-        combined_output = combined_output[:batch_size, :, :]
+
+        best_expert_probabilities = torch.gather(normalized_logits, dim=1, index=index_of_best_expert.unsqueeze(1))
+        best_expert_probabilities = best_expert_probabilities.squeeze(1)  # 去掉多余的维度
+
+        combined_output = combined_output * best_expert_probabilities.view(batch_size, seq_len, 1)
 
         return expert_output
 
