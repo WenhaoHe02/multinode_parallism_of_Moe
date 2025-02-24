@@ -65,13 +65,14 @@ class DistSparseMoe(nn.Module):
         self.expert_num = config.expert_num
         self.experts = nn.ModuleList([BasicExpert(config.hidden_dim, config.hidden_dim)])
         self.router = MoeRouter(config)
-        self.capacity_factor = dist_config.capacity_factor
+        self.dist_config = dist_config
         self.all2all_group = get_all2all_group(self.expert_num)
         self.all2all_size = dist.get_world_size()
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
         hidden_states = x.view(-1, hidden_dim)
+        print(f"hidden_states: {hidden_states.shape}")
         router_logits, router_weights, selected_experts_indices, expert_mask = (
             self.router(hidden_states)
         )
@@ -83,20 +84,25 @@ class DistSparseMoe(nn.Module):
         size_list = torch.bincount(sorted_decision, minlength=self.expert_num)
         recv_sizes = all_to_all_wrapper(size_list)  # 计算隐藏延迟
         print(f"size_list: {size_list}")
-        send_chunks = torch.split(hidden_states, list(size_list))
+        send_chunks = list(torch.split(hidden_states, list(size_list)))
         token_size = recv_sizes.sum()
-        print(f"send_chunks: {send_chunks}, shape: {send_chunks[2].shape}")
-        recv_tokens = [torch.zeros(int(recv_sizes[i].item()), hidden_dim) for i in range(self.all2all_size)]
+        print(f"send_chunks: {send_chunks}, shape: {send_chunks[0].shape}")
+        recv_tokens = [torch.zeros(int(recv_sizes[i].item()), hidden_dim, dtype=torch.bfloat16, device=self.dist_config.device) for i in range(self.all2all_size)]
+        print(f"recv_tokens: {recv_tokens}, shape: {recv_tokens[0].shape}, length: {len(recv_tokens)}")
+
         dist.all_to_all(recv_tokens, send_chunks)
-        expert_outputs = torch.zeros(token_size, hidden_dim)
-        for chunk, expert in zip(recv_tokens, self.experts):
-            if chunk.size(0) > 0:
-                expert_outputs.append(expert(chunk))
-        expert_output = torch.cat(expert_outputs, dim=0)
-        print(f"expert_output {expert_output}, shape: {expert_output.shape}")
-        expert_output = all_to_all_wrapper(self.all2all_group, expert_output)
+
+        print(f"rank: {dist.get_rank()}, recv_tokens: {recv_tokens}, shape: {recv_tokens[1].shape}, length: {len(recv_tokens)}")
+        chunk = torch.cat(recv_tokens, dim=0)  # 沿着第 0 维拼接
+        # for chunk, expert in zip(recv_tokens, self.experts):
+        expert_outputs = [self.experts[0](chunk)]
+        expert_output =list(torch.split(expert_outputs[0], recv_sizes.tolist(), dim=0))
+        print(f"expert_outputs: {expert_outputs}, len: {len(expert_outputs)}, shape: {expert_outputs[0].shape}")
+        rerecv_tokens = [torch.zeros(int(size_list[i].item()), hidden_dim, dtype=torch.bfloat16, device=self.dist_config.device) for i in range(self.all2all_size)]
+        dist.all_to_all(rerecv_tokens, expert_output)
+
         # TODO 还需要乘对应的概率矩阵，但不一定是在这个位置
-        combined_output = expert_output[:batch_size * seq_len, :]  # 去除可能的填充
+        combined_output = torch.cat(rerecv_tokens, dim=0)  # 沿着第 0 维拼接
         combined_output = combined_output.reshape(batch_size, seq_len, hidden_dim)
 
         best_expert_probabilities = torch.gather(normalized_logits, dim=1, index=index_of_best_expert.unsqueeze(1))
@@ -104,7 +110,7 @@ class DistSparseMoe(nn.Module):
 
         combined_output = combined_output * best_expert_probabilities.view(batch_size, seq_len, 1)
 
-        return expert_output
+        return combined_output
 
 
 class DistShareExpertMOE(nn.Module):
@@ -122,7 +128,7 @@ class DistShareExpertMOE(nn.Module):
     def forward(self, x):
         # x shape 是 (b, s, hidden_dim)
         # 首先过 moe 模型
-        sparse_moe_out, router_logits = self.moe_model(x)
+        sparse_moe_out = self.moe_model(x)
 
         # 针对的还是 x 的每一个
         # 然后过 shared experts
@@ -133,4 +139,4 @@ class DistShareExpertMOE(nn.Module):
         shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
 
         # 把 sparse_moe_out 和 shared_experts_out 加起来
-        return sparse_moe_out + shared_experts_out, router_logits
+        return sparse_moe_out + shared_experts_out

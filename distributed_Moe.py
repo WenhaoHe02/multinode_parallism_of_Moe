@@ -171,7 +171,7 @@ class DistShareExpertMOE(nn.Module):
     def forward(self, x):
         # x shape 是 (b, s, hidden_dim)
         # 首先过 moe 模型
-        sparse_moe_out, router_logits = self.moe_model(x)
+        sparse_moe_out = self.moe_model(x)
 
         # 针对的还是 x 的每一个
         # 然后过 shared experts
@@ -182,4 +182,4 @@ class DistShareExpertMOE(nn.Module):
         shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
 
         # 把 sparse_moe_out 和 shared_experts_out 加起来
-        return sparse_moe_out + shared_experts_out, router_logits
+        return sparse_moe_out + shared_experts_out
