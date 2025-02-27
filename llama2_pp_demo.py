@@ -84,11 +84,7 @@ class Llama(nn.Module):
         super().__init__()
         self.token_embd_table = nn.Embedding(config.vocab_size, config.hidden_dim)
         self.position_embd_table = nn.Embedding(config.max_seq, config.hidden_dim)
-
-        for i in range(config.n_layer):
-            super().add_module(f"block{i}", Block(config))
-        self.n_layer = config.n_layer
-
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
         self.rn_final = nn.LayerNorm(config.hidden_dim)
         self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
         # 使用tie weight减少嵌入参数
@@ -110,11 +106,7 @@ class Llama(nn.Module):
             torch.arange(seq_len, device=idx.device)
         )
         x = token_embd + postion_embd
-
-        for i in range(self.n_layer):
-            block = getattr(self, f"block{i}")
-            x = block(x)
-        
+        x = self.blocks(x)
         x = self.rn_final(x)
         logits = self.lm_head(x)
         if target is None:
@@ -128,10 +120,10 @@ class Llama(nn.Module):
     
 
 class LlamaEmbedding(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, from_model: Llama):
         super().__init__()
-        self.token_embd_table = nn.Embedding(config.vocab_size, config.hidden_dim)
-        self.position_embd_table = nn.Embedding(config.max_seq, config.hidden_dim)
+        self.token_embd_table = from_model.token_embd_table
+        self.position_embd_table = from_model.position_embd_table
 
     def forward(self, idx: torch.Tensor):
         batch, seq_len = idx.size()
@@ -143,10 +135,10 @@ class LlamaEmbedding(nn.Module):
         return x
 
 class LlamaFinal(nn.Module):
-    def __init__(self, config: LlamaConfig):
+    def __init__(self, from_model: Llama):
         super().__init__()
-        self.rn_final = nn.LayerNorm(config.hidden_dim)
-        self.lm_head = nn.Linear(config.hidden_dim, config.vocab_size, bias=False)
+        self.rn_final = from_model.rn_final
+        self.lm_head = from_model.lm_head
 
     def forward(self, x: torch.Tensor):
         x = self.rn_final(x)
@@ -178,7 +170,7 @@ else:
 
 # Create the pipeline
 config = LlamaConfig()
-model: Llama = Llama(config).to(device)
+full_model: Llama = Llama(config).to(device)
 
 batch_size = config.batch_size
 max_seq = config.max_seq
@@ -192,11 +184,11 @@ dist.init_process_group(rank=rank, world_size=world_size)
 # Pipeline stage is our main pipeline runtime. It takes in the pipe object,
 # the rank of this process, and the device.
 if rank == 0:
-    module = LlamaEmbedding(config)
+    module = LlamaEmbedding(full_model)
 elif rank == world_size - 1:
-    module = LlamaFinal(config)
+    module = LlamaFinal(full_model)
 else:
-    module = Block(config)
+    module = full_model.blocks[rank - 1]
 stage = PipelineStage(module, rank, world_size, device)
 
 # Attach to a schedule
