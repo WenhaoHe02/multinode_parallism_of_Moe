@@ -35,7 +35,7 @@ class ExpertParallel(nn.Module):
 
         # 第一次all_to_all通信：分发输入到各个专家
         x_split = list(x.chunk(expert_degree, dim=1))
-        recv_x = [torch.zeros_like(x_split[0]) for _ in range(expert_degree)]
+        recv_x = [torch.zeros_like(x_split[i]) for i in range(expert_degree)]
         dist.all_to_all(recv_x, x_split)
 
         # 合并接收数据并处理
