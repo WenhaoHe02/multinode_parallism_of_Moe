@@ -1,10 +1,10 @@
 import math
+import os
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
 from typing import *
-from torch.distributed.pipelining import pipeline, SplitPoint, ScheduleGPipe, PipelineStage
-import os
+from torch.distributed.pipelining import ScheduleGPipe, PipelineStage
 
 from config import LlamaConfig
 
@@ -179,8 +179,6 @@ else:
 # Create the pipeline
 config = LlamaConfig()
 model: Llama = Llama(config).to(device)
-
-split_spec = { f"block{stage}": SplitPoint.END for stage in range(config.n_layer) }
 
 batch_size = config.batch_size
 max_seq = config.max_seq
