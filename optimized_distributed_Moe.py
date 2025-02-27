@@ -82,15 +82,23 @@ class DistSparseMoe(nn.Module):
         optimal_index = torch.argsort(index_of_best_expert)
         sorted_decision = index_of_best_expert[optimal_index]  # indexing,并行执行
         size_list = torch.bincount(sorted_decision, minlength=self.expert_num)
-        recv_sizes = all_to_all_wrapper(size_list)  # 计算隐藏延迟
-        print(f"size_list: {size_list}")
-        send_chunks = list(torch.split(hidden_states, list(size_list)))
-        token_size = recv_sizes.sum()
+        comm_stream = torch.cuda.Stream()
+
+        with torch.cuda.stream(comm_stream):
+            recv_sizes = torch.zeros_like(size_list)
+            dist.all_to_all_single(recv_sizes, size_list)
+
+        # 主流继续执行计算
+        sorted_hidden_states = hidden_states[optimal_index]
+        send_chunks = list(torch.split(sorted_hidden_states, size_list.tolist()))
+
+        # 同步流
+        torch.cuda.current_stream().wait_stream(comm_stream)
         print(f"send_chunks: {send_chunks}, shape: {send_chunks[0].shape}")
         recv_tokens = [torch.zeros(int(recv_sizes[i].item()), hidden_dim, dtype=torch.bfloat16, device=self.dist_config.device) for i in range(self.all2all_size)]
         print(f"recv_tokens: {recv_tokens}, shape: {recv_tokens[0].shape}, length: {len(recv_tokens)}")
 
-        dist.all_to_all(recv_tokens, send_chunks)
+        dist.all_to_all_single(recv_tokens, send_chunks)
 
         print(f"rank: {dist.get_rank()}, recv_tokens: {recv_tokens}, shape: {recv_tokens[1].shape}, length: {len(recv_tokens)}")
         chunk = torch.cat(recv_tokens, dim=0)  # 沿着第 0 维拼接
