@@ -21,8 +21,8 @@ class LlamaConfig:
     batch_size: int = 12
     n_layer: int = 12
     n_head: int = 12
-    hidden_dim: int = 768
+    hidden_dim: int = 384
     dropout: float = 0.1
     head_size: int = hidden_dim // n_head
     # vocab_size: int = 50257
-    vocab_size: int = 768
+    vocab_size: int = 384

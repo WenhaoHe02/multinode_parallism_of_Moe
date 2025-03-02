@@ -27,9 +27,9 @@ def all_to_all_wrapper(input: torch.Tensor):
     cuda_start = torch.cuda.Event(enable_timing=True)
     cuda_end = torch.cuda.Event(enable_timing=True)
     cpu_start = time.time() * 1000
-    cuda_start.record()
+    # cuda_start.record()
     output = _AllToAll.forward(input)
-    cuda_end.record()
+    # cuda_end.record()
     cpu_end = time.time() * 1000
     return output
 

@@ -74,7 +74,7 @@ class DistSparseMoe(nn.Module):
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
-        capacity = int(batch_size * seq_len // self.expert_num * self.capacity_factor)
+        capacity = 20
         hidden_states = x.view(-1, hidden_dim)
         router_logits, router_weights, selected_experts_indices, expert_mask = (
             self.router(hidden_states)

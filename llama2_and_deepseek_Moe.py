@@ -294,26 +294,26 @@ def test_share_expert_moe():
     print(out[0].shape, out[1].shape)
 
 
-# test_share_expert_moe()
+test_share_expert_moe()
 
 
-# config = LlamaConfig()
+config = LlamaConfig()
 
 
-# model = Llama(config)
+model = Llama(config)
 
 
-# batch_size = config.batch_size
-# max_seq = config.max_seq
+batch_size = config.batch_size
+max_seq = config.max_seq
 
 
-# random_input = torch.randint(0, config.vocab_size, (batch_size, max_seq))
+random_input = torch.randint(0, config.vocab_size, (batch_size, max_seq))
 
 
-# random_target = torch.randint(0, config.vocab_size, (batch_size, max_seq))
+random_target = torch.randint(0, config.vocab_size, (batch_size, max_seq))
 
 
-# logits, loss = model(random_input, random_target)
+logits, loss = model(random_input, random_target)
 
-# print("logits shape:", logits.shape)
-# print("loss:", loss.item())
+print("logits shape:", logits.shape)
+print("loss:", loss.item())
