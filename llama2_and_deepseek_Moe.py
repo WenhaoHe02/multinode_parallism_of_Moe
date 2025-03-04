@@ -1,8 +1,10 @@
 import math
+import time
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
 from typing import *
+from argparse import ArgumentParser
 
 from config import LlamaConfig, MoeConfig
 
@@ -124,11 +126,20 @@ class Llama(nn.Module):
 
 
 class BasicExpert(nn.Module):
+    # 定义一个基本的专家类，继承自nn.Module
     def __init__(self, feature_in: int, feature_out: int):
+        # 初始化函数，接收两个参数，feature_in和feature_out
         super().__init__()
-        self.fc = nn.Linear(feature_in, feature_out)
+        # 调用父类的初始化函数
+        self.fc = nn.Linear(feature_in, feature_out, dtype=torch.float64)
+        # 定义一个全连接层，输入维度为feature_in，输出维度为feature_out
+        custom_weight = torch.ones(feature_in, feature_out, dtype=torch.float64)
+        # 定义一个全为1的权重矩阵
+        self.fc.weight = nn.Parameter(custom_weight)
 
+        # 将权重矩阵设置为全连接层的权重
     def forward(self, x: torch.Tensor):
+        # 定义前向传播函数，接收一个参数x
         return self.fc(x)
 
 
@@ -136,6 +147,9 @@ class BasicMoe(nn.Module):
     def __init__(self, feature_in: int, feature_out: int, num_expert):
         super().__init__()
         self.gate = nn.Linear(in_features=feature_in, out_features=num_expert)
+        custom_weight = torch.ones(feature_in, num_expert)
+        # 定义一个全为1的权重矩阵
+        self.gate.weight = nn.Parameter(custom_weight)
         self.experts = nn.ModuleList(
             BasicExpert(feature_in, feature_out) for _ in range(num_expert)
         )
@@ -163,14 +177,17 @@ class BasicMoe(nn.Module):
 class MoeRouter(nn.Module):
     def __init__(self, config: MoeConfig):
         super().__init__()
-        self.gate = nn.Linear(config.hidden_dim, config.expert_num)
+        self.gate = nn.Linear(config.hidden_dim, config.expert_num, dtype=torch.float64)
+        custom_weight = torch.ones(config.expert_num, config.hidden_dim, dtype=torch.float64)
+        # 定义一个全为1的权重矩阵
+        self.gate.weight = nn.Parameter(custom_weight)
         self.expert_num = config.expert_num
         self.top_k = config.topk
 
     def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(x)
         # router_logits[bs*seq_len, expert_num]
-        router_probs = F.softmax(router_logits, dim=1, dtype=torch.float)
+        router_probs = F.softmax(router_logits, dim=1, dtype=torch.float64)
         router_weights, selected_experts_indices = torch.topk(
             router_probs, self.top_k, dim=-1
         )
@@ -283,37 +300,67 @@ class ShareExpertMOE(nn.Module):
         shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
 
         # 把 sparse_moe_out 和 shared_experts_out 加起来
-        return sparse_moe_out + shared_experts_out, router_logits
+        return sparse_moe_out + shared_experts_out
 
 
 def test_share_expert_moe():
-    x = torch.rand(2, 4, 16)
-    config = MoeConfig(16, 4, 2)
-    share_expert_moe = ShareExpertMOE(config)
-    out = share_expert_moe(x)
-    print(out[0].shape, out[1].shape)
+    # 构造输入数据
+    batch_size, seq_len, hidden_dim = 64, 512, 128
+    x = torch.arange(batch_size * seq_len * hidden_dim, dtype=torch.float64).reshape(batch_size, seq_len, hidden_dim)
+
+    parser = ArgumentParser()
+    parser.add_argument("--device_id", type=int, default=-1, help="指定 GPU 设备 id, 不使用 GPU 则保持默认值 -1")
+    args = parser.parse_args()
+
+    # 根据 device_id 确定运行设备
+    device = f"cuda:{args.device_id}" if args.device_id != -1 and torch.cuda.is_available() else "cpu"
+    x = x.to(device)
+
+    # 构造配置，注意 MoeConfig 中应包含 shared_expert_num 字段
+    config = MoeConfig(hidden_dim=128, expert_num=3, topk=2, shared_expert_num=1)
+    share_expert_moe = ShareExpertMOE(config).to(device)
+
+    # warmup 阶段：多次前向传播，但不计时
+    warmup = 10
+    for _ in range(warmup):
+        _ = share_expert_moe(x)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize()
+
+    # 正式计时 run_iterations 次，计算平均时间（单位：毫秒）
+    run_iterations = 1
+    start_time = time.time()
+    for _ in range(run_iterations):
+        out = share_expert_moe(x)
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+    end_time = time.time()
+
+    avg_time_ms = (end_time - start_time) / run_iterations * 1000
+    print(f"平均执行时间：{avg_time_ms:.6f} 毫秒/次")
+    print(f"模型输出 shape: {out.shape}")
+
+if __name__ == "__main__":
+    test_share_expert_moe()
 
 
-test_share_expert_moe()
+# config = LlamaConfig()
 
 
-config = LlamaConfig()
+# model = Llama(config)
 
 
-model = Llama(config)
+# batch_size = config.batch_size
+# max_seq = config.max_seq
 
 
-batch_size = config.batch_size
-max_seq = config.max_seq
+# random_input = torch.randint(0, config.vocab_size, (batch_size, max_seq))
 
 
-random_input = torch.randint(0, config.vocab_size, (batch_size, max_seq))
+# random_target = torch.randint(0, config.vocab_size, (batch_size, max_seq))
 
 
-random_target = torch.randint(0, config.vocab_size, (batch_size, max_seq))
+# logits, loss = model(random_input, random_target)
 
-
-logits, loss = model(random_input, random_target)
-
-print("logits shape:", logits.shape)
-print("loss:", loss.item())
+# print("logits shape:", logits.shape)
+# print("loss:", loss.item())

@@ -15,16 +15,17 @@ def init_dist(dist_config: DistConfig):
     print(f"rank {dist.get_rank()} device {dist_config.device}")
 
 def run_distributed_share_expert_moe(warmup: int, runs: int):
-    x = torch.rand(1, 1, 16)
-    config = MoeConfig(16, 3, 2)
+    # x = torch.rand(1, 1, 16)
+    x = torch.arange(64 * 512 *128).reshape(64, 512, 128)
+    config = MoeConfig(128, 3, 2)
     dist_config = DistConfig()
     dist_config.world_size = 3
     init_dist(dist_config)
     share_expert_moe = DistShareExpertMOE(config, dist_config)
     share_expert_moe_baseline = DistShareExpertMOEBaseline(config, dist_config)
-    share_expert_moe = share_expert_moe.to(device=dist_config.device, dtype=torch.bfloat16)
-    share_expert_moe_baseline = share_expert_moe_baseline.to(device=dist_config.device, dtype=torch.bfloat16)
-    x = x.to(device=dist_config.device, dtype=torch.bfloat16)
+    share_expert_moe = share_expert_moe.to(device=dist_config.device, dtype=torch.float64)
+    share_expert_moe_baseline = share_expert_moe_baseline.to(device=dist_config.device, dtype=torch.float64)
+    x = x.to(device=dist_config.device, dtype=torch.float64)
     
     # 设置为评估模式
     share_expert_moe_baseline.eval()
@@ -55,6 +56,8 @@ def run_distributed_share_expert_moe(warmup: int, runs: int):
             start_time = time.time()
             out_baseline = share_expert_moe_baseline(x)
             total_time_baseline += (time.time() - start_time) * 1000  # 转换为毫秒
+            print(f"out_moe: {out_moe}", f"shape: {out_moe.shape}")
+            print(f"out_baseline: {out_baseline}", f"shape: {out_baseline.shape}")
 
             # 比较两个模型的输出
             if not torch.allclose(out_moe, out_baseline, atol=1e-6):

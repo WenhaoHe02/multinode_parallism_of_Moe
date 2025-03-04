@@ -74,7 +74,7 @@ class DistSparseMoe(nn.Module):
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
-        capacity = 20
+        capacity = 32
         hidden_states = x.view(-1, hidden_dim)
         router_logits, router_weights, selected_experts_indices, expert_mask = (
             self.router(hidden_states)
@@ -139,7 +139,7 @@ class DistSparseMoe(nn.Module):
             expert_outputs += [expert(chunk)]
         print(f"expert_outputs: {expert_outputs}")
         expert_output = torch.cat(expert_outputs, dim=1)
-        print(f"expert_output: {expert_output}, shape: {expert_output.shape}")
+        # print(f"expert_output: {expert_output}, shape: {expert_output.shape}")
         expert_output = all_to_all_wrapper(self.all2all_group, expert_output)
         # Re-shape back: gecm -> ecm
         expert_output = expert_output.reshape(

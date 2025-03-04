@@ -1,0 +1,29 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "llama2_and_deepseek_Moe",
+            "type": "debugpy",
+            "request": "launch",
+            "console": "integratedTerminal",
+            "args": [
+                "--device_id", "7",
+            ],
+            "program": "${workspaceFolder}/llama2_and_deepseek_Moe.py"
+        },
+        {
+            "name": "run_distributed_MoE",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.run",
+            "console": "integratedTerminal",
+            "args": [
+                "--nproc_per_node", "3",
+                "${workspaceFolder}/run_distributed_Moe.py"
+            ],
+        }
+    ]
+}

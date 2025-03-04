@@ -87,7 +87,7 @@ class DistSparseMoe(nn.Module):
         send_chunks = list(torch.split(hidden_states, list(size_list)))
         token_size = recv_sizes.sum()
         print(f"send_chunks: {send_chunks}, shape: {send_chunks[0].shape}")
-        recv_tokens = [torch.zeros(int(recv_sizes[i].item()), hidden_dim, dtype=torch.bfloat16, device=self.dist_config.device) for i in range(self.all2all_size)]
+        recv_tokens = [torch.zeros(int(recv_sizes[i].item()), hidden_dim, dtype=torch.float64, device=self.dist_config.device) for i in range(self.all2all_size)]
         print(f"recv_tokens: {recv_tokens}, shape: {recv_tokens[0].shape}, length: {len(recv_tokens)}")
 
         dist.all_to_all(recv_tokens, send_chunks)
@@ -98,7 +98,7 @@ class DistSparseMoe(nn.Module):
         expert_outputs = [self.experts[0](chunk)]
         expert_output =list(torch.split(expert_outputs[0], recv_sizes.tolist(), dim=0))
         print(f"expert_outputs: {expert_outputs}, len: {len(expert_outputs)}, shape: {expert_outputs[0].shape}")
-        rerecv_tokens = [torch.zeros(int(size_list[i].item()), hidden_dim, dtype=torch.bfloat16, device=self.dist_config.device) for i in range(self.all2all_size)]
+        rerecv_tokens = [torch.zeros(int(size_list[i].item()), hidden_dim, dtype=torch.float64, device=self.dist_config.device) for i in range(self.all2all_size)]
         dist.all_to_all(rerecv_tokens, expert_output)
 
         # TODO 还需要乘对应的概率矩阵，但不一定是在这个位置
@@ -107,7 +107,7 @@ class DistSparseMoe(nn.Module):
 
         best_expert_probabilities = torch.gather(normalized_logits, dim=1, index=index_of_best_expert.unsqueeze(1))
         best_expert_probabilities = best_expert_probabilities.squeeze(1)  # 去掉多余的维度
-
+        
         combined_output = combined_output * best_expert_probabilities.view(batch_size, seq_len, 1)
 
         return combined_output
