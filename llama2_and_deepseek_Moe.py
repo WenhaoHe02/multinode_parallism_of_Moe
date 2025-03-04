@@ -52,8 +52,8 @@ class MultiHeadAttention(nn.Module):
 
     def forward(self, x: torch.Tensor):
         output = torch.cat([h(x) for h in self.heads], dim=-1)
-        output = self.proj(x)
-        output = self.dropout(x)
+        output = self.proj(output)
+        output = self.dropout(output)
         return output
 
 
