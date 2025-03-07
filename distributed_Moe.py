@@ -74,37 +74,37 @@ class DistSparseMoe(nn.Module):
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
-        capacity = 32
+        capacity = 1500
         hidden_states = x.view(-1, hidden_dim)
         router_logits, router_weights, selected_experts_indices, expert_mask = (
             self.router(hidden_states)
         )
-        print(f"router_logits: {router_logits}, shape: {router_logits.shape}")
+        # print(f"router_logits: {router_logits}, shape: {router_logits.shape}")
         expert_layer = self.experts
         normalized_logits = F.softmax(router_logits, dim=1)
         index_of_best_expert = torch.argmax(normalized_logits, dim=1)
         classified_expert_mask = F.one_hot(
             index_of_best_expert, num_classes=self.expert_num
         )
-        print(
-            f"normalized_logits: {normalized_logits}, shape: {normalized_logits.shape}"
-        )
-        print(
-            f"classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
-        )
+        # print(
+        #     f"normalized_logits: {normalized_logits}, shape: {normalized_logits.shape}"
+        # )
+        # print(
+        #     f"classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
+        # )
         normalized_logits_sum = (normalized_logits * classified_expert_mask).sum(dim=1)
         locations = get_fused_cumsum_sub_one()(classified_expert_mask)
-        print(f"locations: {locations}, shape: {locations.shape}")
+        # print(f"locations: {locations}, shape: {locations.shape}")
 
-        print(
-            f"before classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
-        )
+        # print(
+        #     f"before classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
+        # )
         classified_expert_mask = (
-            classified_expert_mask * torch.lt(locations, capacity).float()
+            classified_expert_mask * torch.lt(locations, capacity).int()
         )
-        print(
-            f"after classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
-        )
+        # print(
+        #     f"after classified_expert_mask: {classified_expert_mask}, shape: {classified_expert_mask.shape}"
+        # )
         locations_sum = torch.sum(
             locations * classified_expert_mask, dim=1, dtype=torch.int64
         )
@@ -113,7 +113,7 @@ class DistSparseMoe(nn.Module):
         ) * classified_expert_mask.to(
             normalized_logits_sum.dtype
         )  # einsum("s,se->se")
-        print(f"locations_sum: {locations_sum}, shape: {locations_sum.shape}")
+        # print(f"locations_sum: {locations_sum}, shape: {locations_sum.shape}")
         classified_location = F.one_hot(locations_sum, num_classes=capacity)
         combine_weight = torch.bmm(
             # einsum("se,sc->sec")
@@ -137,7 +137,7 @@ class DistSparseMoe(nn.Module):
         expert_outputs = []
         for chunk, expert in zip(chunks, self.experts):
             expert_outputs += [expert(chunk)]
-        print(f"expert_outputs: {expert_outputs}")
+        # print(f"expert_outputs: {expert_outputs}")
         expert_output = torch.cat(expert_outputs, dim=1)
         # print(f"expert_output: {expert_output}, shape: {expert_output.shape}")
         expert_output = all_to_all_wrapper(self.all2all_group, expert_output)
@@ -171,13 +171,15 @@ class DistShareExpertMOE(nn.Module):
     def forward(self, x):
         # x shape 是 (b, s, hidden_dim)
         # 首先过 moe 模型
-        sparse_moe_out = self.moe_model(x)
+        with torch.no_grad():
+            sparse_moe_out = self.moe_model(x)
 
         # 针对的还是 x 的每一个
         # 然后过 shared experts
-        shared_experts_out = [
-            expert(x) for expert in self.shared_experts
-        ]  # 每一个 expert 的输出 shape 是 (b, s, hidden_dim)
+        with torch.no_grad():
+            shared_experts_out = [
+                expert(x) for expert in self.shared_experts
+            ]  # 每一个 expert 的输出 shape 是 (b, s, hidden_dim)
 
         shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
 

@@ -5,6 +5,8 @@ import sys
 import nnx
 from dataclasses import dataclass
 import argparse
+import sys
+sys.path.append('/home/zbw/multinode_parallism_of_Moe')
 
 logger.remove()
 logger.add(sys.stdout, format="{time} {level} {message}", level="INFO")

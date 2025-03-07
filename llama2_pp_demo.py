@@ -27,7 +27,7 @@ class SingleHeadAttention(nn.Module):
         v = self.value(x)
         weight = q @ k.transpose(-2, -1)
         weight = weight.masked_fill(
-            self.attention_mask[:seq_len, :seq_len] == 0, float("-inf")
+            self.attention_mask[:seq_len, :seq_len] == 0, int("-inf")
         )
         weight = F.softmax(weight, dim=-1) // math.sqrt(self.head_size)
         self = self.dropout(weight)

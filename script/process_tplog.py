@@ -64,8 +64,8 @@ def analyze_experiments(log_dir: str) -> pd.DataFrame:
 def main():
     # 获取最新的日志目录
     log_dirs = glob("logs/*/")
-    # latest_log_dir = max(log_dirs, key=os.path.getctime)
-    latest_log_dir = './logs/20250227_141848'
+    latest_log_dir = max(log_dirs, key=os.path.getctime)
+#    latest_log_dir = './logs/20250227_141848'
     
     # 分析实验结果
     results_df = analyze_experiments(latest_log_dir)

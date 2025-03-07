@@ -1,10 +1,8 @@
-#!/bin/bash
-
 MODES=("row" "column" "combined")
-INPUT_FEATURES=(128)
-BATCH_SIZES=(2)
-NUM_GPUS=(2)
-SEQ_LEN=(128)
+INPUT_FEATURES=(64 128 512 1024)
+BATCH_SIZES=(1 2 4 8)
+NUM_GPUS=(1 2 4 8)
+SEQ_LEN=(64 128 256 512)
 
 LOG_DIR="logs/$(date +%Y%m%d_%H%M)"
 mkdir -p "$LOG_DIR"
@@ -22,7 +20,7 @@ for mode in "${MODES[@]}"; do
                     OMP_NUM_THREADS=1 \
                         torchrun \
                             --nproc_per_node=$gpus \
-                            test_tp.py \
+                            script/test_tp.py \
                             --mode "$mode" \
                             --input-features "$feat" \
                             --output-features "$feat" \

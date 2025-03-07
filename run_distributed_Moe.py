@@ -12,12 +12,12 @@ def init_dist(dist_config: DistConfig):
         backend=dist_config.backend, world_size=dist_config.world_size
     )
     dist_config.device = torch.device(f"cuda:{dist.get_rank()}")
-    print(f"rank {dist.get_rank()} device {dist_config.device}")
+    # print(f"rank {dist.get_rank()} device {dist_config.device}")
 
 def run_distributed_share_expert_moe(warmup: int, runs: int):
     # x = torch.rand(1, 1, 16)
-    x = torch.arange(64 * 512 *128).reshape(64, 512, 128)
-    config = MoeConfig(128, 3, 2)
+    x = torch.arange(8 * 512 * 2048, dtype=torch.float64).reshape(8, 512, 2048)
+    config = MoeConfig(2048, 3, 2)
     dist_config = DistConfig()
     dist_config.world_size = 3
     init_dist(dist_config)
@@ -56,8 +56,10 @@ def run_distributed_share_expert_moe(warmup: int, runs: int):
             start_time = time.time()
             out_baseline = share_expert_moe_baseline(x)
             total_time_baseline += (time.time() - start_time) * 1000  # 转换为毫秒
-            print(f"out_moe: {out_moe}", f"shape: {out_moe.shape}")
-            print(f"out_baseline: {out_baseline}", f"shape: {out_baseline.shape}")
+            
+            if (dist.get_rank() == 0):
+                print(f"out_moe: {out_moe[0:20]}", f"shape: {out_moe.shape}")
+                print(f"out_baseline: {out_baseline[0:20]}", f"shape: {out_baseline.shape}")
 
             # 比较两个模型的输出
             if not torch.allclose(out_moe, out_baseline, atol=1e-6):
@@ -66,6 +68,8 @@ def run_distributed_share_expert_moe(warmup: int, runs: int):
     # 打印结果
     avg_time = total_time / runs
     avg_time_baseline = total_time_baseline / runs
+    if (dist.get_rank() == 0):
+        print(f"out_baseline前3个数据:{out_baseline[0:1][0:3][0:10]}")
 
     print(f"ShareExpertMOE average time over {runs} runs: {avg_time:.2f} ms")
     print(f"Baseline ShareExpertMOE average time over {runs} runs: {avg_time_baseline:.2f} ms")
@@ -77,4 +81,4 @@ def run_distributed_share_expert_moe(warmup: int, runs: int):
         print("The results from ShareExpertMOE and Baseline ShareExpertMOE are different.")
 
 # 运行示例
-run_distributed_share_expert_moe(1, 10)
+run_distributed_share_expert_moe(20, 10)

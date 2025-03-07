@@ -33,7 +33,7 @@ class SingleHeadAttention(nn.Module):
         v = self.value(x)
         weight = q @ k.transpose(-2, -1)
         weight = weight.masked_fill(
-            self.attention_mask[:seq_len, :seq_len] == 0, float("-inf")
+            self.attention_mask[:seq_len, :seq_len] == 0, int("-inf")
         )
         weight = F.softmax(weight, dim=-1) // math.sqrt(self.head_size)
         self = self.dropout(weight)
@@ -234,7 +234,7 @@ class SparseMoe(nn.Module):
             expert_layer = self.experts[expert_idx]
             # expert_mask[expert_idx] shape 是 (top_k, b * s)
             idx, top_x = torch.where(expert_mask[expert_idx])
-            print("expert mask:{}", expert_mask.shape)
+            # print("expert mask:{}", expert_mask.shape)
             # idx 和 top_x 都是一维 tensor
             # idx 的值是 0 或 1, 表示这个 token 是作为当前专家的 top1 还是 top2
             # top_x 的值是 token 在 batch*seq_len 中的位置索引
@@ -244,8 +244,8 @@ class SparseMoe(nn.Module):
 
             # hidden_states 的 shape 是 (bs * seq_len, hidden_dim)
             # 需要取到 top_x 对应的 hidden_states
-            print(f"topx_shape: {top_x.shape}")
-            print(f"topx: {top_x}")
+            # print(f"topx_shape: {top_x.shape}")
+            # print(f"topx: {top_x}")
             current_state = hidden_states.unsqueeze(0)[:, top_x, :].reshape(
                 -1, hidden_dim
             )  # （selected_token_number, hidden_dim）
@@ -305,7 +305,7 @@ class ShareExpertMOE(nn.Module):
 
 def test_share_expert_moe():
     # 构造输入数据
-    batch_size, seq_len, hidden_dim = 64, 512, 128
+    batch_size, seq_len, hidden_dim = 8, 512, 2048
     x = torch.arange(batch_size * seq_len * hidden_dim, dtype=torch.float64).reshape(batch_size, seq_len, hidden_dim)
 
     parser = ArgumentParser()
@@ -317,7 +317,7 @@ def test_share_expert_moe():
     x = x.to(device)
 
     # 构造配置，注意 MoeConfig 中应包含 shared_expert_num 字段
-    config = MoeConfig(hidden_dim=128, expert_num=3, topk=2, shared_expert_num=1)
+    config = MoeConfig(hidden_dim=2048, expert_num=3, topk=1, shared_expert_num=1)
     share_expert_moe = ShareExpertMOE(config).to(device)
 
     # warmup 阶段：多次前向传播，但不计时
@@ -337,6 +337,8 @@ def test_share_expert_moe():
     end_time = time.time()
 
     avg_time_ms = (end_time - start_time) / run_iterations * 1000
+    # 打印前3个数据
+    print(f"前3个数据：{out[:1][:3][:10]}")
     print(f"平均执行时间：{avg_time_ms:.6f} 毫秒/次")
     print(f"模型输出 shape: {out.shape}")
 
