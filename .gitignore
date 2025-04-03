@@ -3,3 +3,23 @@
 **/logs
 **/log
 **/*.log
+log_dir/
+moe_logs/
+logs/
+
+# 忽略 runs 目录中的所有内容
+trace/
+*.log
+*.txt
+# 忽略所有文件
+*
+
+# 但保留 .gitignore 文件本身
+!.gitignore
+
+# 保留所有 .py 文件（包括当前目录）
+!*.py
+
+# 保留所有子目录中的 .py 文件
+!*/**/*.py
+

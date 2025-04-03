@@ -6,6 +6,9 @@ import nnx
 from dataclasses import dataclass
 import argparse
 import sys
+import os
+import torch.nn as nn
+from torch.profiler import profile, record_function, ProfilerActivity
 sys.path.append('/home/zbw/multinode_parallism_of_Moe')
 
 logger.remove()
@@ -33,13 +36,36 @@ def main(config):
             mode=config.mode,
         ).to(device)
 
+        relu = nn.ReLU()
+
         model.load_state_dict
         
         input = torch.randn(config.batch_size, config.seq_len, config.d_model).to(device)
 
+        log_dir = f"logs/traces"
+        os.makedirs(log_dir, exist_ok=True)
+        trace_file = f"{log_dir}/trace_f{config.d_model}_b{config.batch_size}_g{dist.get_world_size()}_s{config.seq_len}_rank{rank}.json"
+        
+        # Warmup
         for _ in range(config.warmup):
-            _ = model(input)
+            _ = relu(model(input))
 
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+        ) as prof:
+            for _ in range(config.runs):
+                with record_function("model_inference"):
+                    _ = relu(model(input))
+                prof.step()
+
+        # 每个 rank 都保存自己的 trace 文件
+        prof.export_chrome_trace(trace_file)
+        logger.info(f"[rank {rank}] Trace file saved to: {trace_file}")
+
+        # 原有的时间测量代码
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         elapsed_times = []
@@ -62,11 +88,11 @@ def main(config):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Parallel Linear Layer Benchmark')
-    parser.add_argument('--input-features', type=int, default=1024)
-    parser.add_argument('--output-features', type=int, default=1024)
+    parser.add_argument('--input-features', type=int, default=8192)
+    parser.add_argument('--output-features', type=int, default=8192)
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--seq-len', type=int, default=512)
-    parser.add_argument('--d-model', type=int, default=1024)
+    parser.add_argument('--d-model', type=int, default=8192)
     parser.add_argument('--mode', type=str, choices=['row', 'column', 'combined'], default='combined')
     parser.add_argument('--warmup', type=int, default=10)
     parser.add_argument('--runs', type=int, default=20)

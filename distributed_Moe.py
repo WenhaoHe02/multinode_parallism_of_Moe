@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from llama2_and_deepseek_Moe import MoeRouter, BasicExpert
 import torch.distributed as dist
+from torch.profiler import profile, tensorboard_trace_handler, schedule
 import time
 from config import DistConfig, MoeConfig
 
@@ -74,7 +75,7 @@ class DistSparseMoe(nn.Module):
 
     def forward(self, x: torch.Tensor):
         batch_size, seq_len, hidden_dim = x.size()
-        capacity = 1500
+        capacity = 100
         hidden_states = x.view(-1, hidden_dim)
         router_logits, router_weights, selected_experts_indices, expert_mask = (
             self.router(hidden_states)
@@ -136,6 +137,7 @@ class DistSparseMoe(nn.Module):
         chunks = dispatched_input.chunk(1, dim=1)  # 1是local expert数量
         expert_outputs = []
         for chunk, expert in zip(chunks, self.experts):
+            print(f"chunk shape: {chunk.shape}")
             expert_outputs += [expert(chunk)]
         # print(f"expert_outputs: {expert_outputs}")
         expert_output = torch.cat(expert_outputs, dim=1)
@@ -168,20 +170,41 @@ class DistShareExpertMOE(nn.Module):
             ]
         )
 
+    # def forward(self, x):
+    #     # x shape 是 (b, s, hidden_dim)
+    #     # 1. 使用 tensorboard_trace_handler 记录 moe 模型部分的 trace
+    #     with torch.no_grad():
+    #         with profile(
+    #             record_shapes=True,
+    #             profile_memory=True,
+    #             on_trace_ready=tensorboard_trace_handler('./log_dir/moe_baseline')
+    #         ) as prof_moe:
+    #             sparse_moe_out = self.moe_model(x)
+    #         print("MOE 模型部分 trace 已保存至 ./log_dir/moe")
+        
+    #     # 2. 使用 tensorboard_trace_handler 记录 shared experts 部分的 trace
+    #     with torch.no_grad():
+    #         with profile(
+    #             record_shapes=True,
+    #             profile_memory=True,
+    #             on_trace_ready=tensorboard_trace_handler('./log_dir/shared_experts')
+    #         ) as prof_experts:
+    #             shared_experts_out = [expert(x) for expert in self.shared_experts]
+    #         print("Shared Experts 部分 trace 已保存至 ./log_dir/shared_experts")
+    #     shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
+
+    #     # 合并 moe 和 shared experts 部分的输出
+    #     return sparse_moe_out + shared_experts_out
+
     def forward(self, x):
-        # x shape 是 (b, s, hidden_dim)
-        # 首先过 moe 模型
+    # x 的形状为 (b, s, hidden_dim)
         with torch.no_grad():
+            # 1. 通过 moe 模型
             sparse_moe_out = self.moe_model(x)
-
-        # 针对的还是 x 的每一个
-        # 然后过 shared experts
-        with torch.no_grad():
-            shared_experts_out = [
-                expert(x) for expert in self.shared_experts
-            ]  # 每一个 expert 的输出 shape 是 (b, s, hidden_dim)
-
+        
+        # 2. 通过 shared experts
+        shared_experts_out = [expert(x) for expert in self.shared_experts]
         shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
-
-        # 把 sparse_moe_out 和 shared_experts_out 加起来
+    
+        # 合并 moe 和 shared experts 部分的输出
         return sparse_moe_out + shared_experts_out

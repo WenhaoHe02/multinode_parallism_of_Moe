@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from llama2_and_deepseek_Moe import MoeRouter, BasicExpert
 import torch.distributed as dist
+from torch.profiler import profile, tensorboard_trace_handler, schedule
 import time
 from config import DistConfig, MoeConfig
 
@@ -19,6 +20,8 @@ class _AllToAll:
         return output
 
 
+def get_fused_cumsum_sub_one():
+    return lambda mask: torch.cumsum(mask, dim=0) - 1
 
 
 def all_to_all_wrapper(input: torch.Tensor):
@@ -74,42 +77,37 @@ class DistSparseMoe(nn.Module):
         router_logits, router_weights, selected_experts_indices, expert_mask = (
             self.router(hidden_states)
         )
-        expert_layer = self.experts
         normalized_logits = F.softmax(router_logits, dim=1)
         index_of_best_expert = torch.argmax(normalized_logits, dim=1)
         optimal_index = torch.argsort(index_of_best_expert)
+        start = time.time()
         sorted_decision = index_of_best_expert[optimal_index]  # indexing,并行执行
         size_list = torch.bincount(sorted_decision, minlength=self.expert_num)
-        comm_stream = torch.cuda.Stream()
-
-        with torch.cuda.stream(comm_stream):
-            recv_sizes = torch.zeros_like(size_list)
-            dist.all_to_all_single(recv_sizes, size_list)
+       
+        recv_sizes = torch.zeros_like(size_list)
+        dist.all_to_all_single(recv_sizes, size_list)
 
         # 主流继续执行计算
         sorted_hidden_states = hidden_states[optimal_index]
-        # send_chunks = list(torch.split(sorted_hidden_states, size_list.tolist()))
+        send_chunks = list(torch.split(sorted_hidden_states, size_list.tolist()))
 
-        # 同步流
-        torch.cuda.current_stream().wait_stream(comm_stream)
         # print(f"send_chunks: {send_chunks}, shape: {send_chunks[0].shape}")
         recv_tokens = [torch.zeros(int(recv_sizes[i].item()), hidden_dim, dtype=torch.float64, device=self.dist_config.device) for i in range(self.all2all_size)]
-        recv_tokens = torch.cat(recv_tokens, dim=0)
         # print(f"recv_tokens: {recv_tokens}, shape: {recv_tokens[0].shape}, length: {len(recv_tokens)}")
 
-        dist.all_to_all_single(output=recv_tokens, input=sorted_hidden_states, 
-                               output_split_sizes=recv_sizes.tolist(), input_split_sizes=size_list.tolist())
+        dist.all_to_all(recv_tokens, send_chunks)
 
         # print(f"rank: {dist.get_rank()}, recv_tokens: {recv_tokens}, shape: {recv_tokens[1].shape}, length: {len(recv_tokens)}")
-        expert_output = self.experts[0](recv_tokens)
+        chunk = torch.cat(recv_tokens, dim=0)  # 沿着第 0 维拼接
+        # for chunk, expert in zip(recv_tokens, self.experts):
+        expert_outputs = [self.experts[0](chunk)]
+        expert_output =list(torch.split(expert_outputs[0], recv_sizes.tolist(), dim=0))
         # print(f"expert_outputs: {expert_outputs}, len: {len(expert_outputs)}, shape: {expert_outputs[0].shape}")
         rerecv_tokens = [torch.zeros(int(size_list[i].item()), hidden_dim, dtype=torch.float64, device=self.dist_config.device) for i in range(self.all2all_size)]
-        rerecv_tokens = torch.cat(rerecv_tokens, dim=0)
-        dist.all_to_all_single(output=rerecv_tokens, input=expert_output, 
-                               output_split_sizes=size_list.tolist(), input_split_sizes=recv_sizes.tolist())
+        dist.all_to_all(rerecv_tokens, expert_output)
 
-        # TODO 还需要乘对应的概率矩阵，但不一定是在这个位置
-        combined_output = rerecv_tokens.reshape(batch_size, seq_len, hidden_dim)
+        combined_output = torch.cat(rerecv_tokens, dim=0)  # 沿着第 0 维拼接
+        combined_output = combined_output.reshape(batch_size, seq_len, hidden_dim)
 
         best_expert_probabilities = torch.gather(normalized_logits, dim=1, index=index_of_best_expert.unsqueeze(1))
         best_expert_probabilities = best_expert_probabilities.squeeze(1)  # 去掉多余的维度
@@ -131,20 +129,45 @@ class DistShareExpertMOE(nn.Module):
             ]
         )
 
+    # def forward(self, x):
+    #     # x shape 是 (b, s, hidden_dim)
+    #     # 1. 使用 tensorboard_trace_handler 记录 moe 模型部分的 trace
+    #     with torch.no_grad():
+    #         with profile(
+    #             record_shapes=True,
+    #             profile_memory=True,
+    #             on_trace_ready=tensorboard_trace_handler('./log_dir/moe_opt')
+    #         ) as prof_moe:
+    #             sparse_moe_out = self.moe_model(x)
+    #         print("MOE 模型部分 trace 已保存至 ./log_dir/moe")
+        
+    #     # 2. 使用 tensorboard_trace_handler 记录 shared experts 部分的 trace
+    #     with torch.no_grad():
+    #         with profile(
+    #             record_shapes=True,
+    #             profile_memory=True,
+    #             on_trace_ready=tensorboard_trace_handler('./log_dir/shared_experts')
+    #         ) as prof_experts:
+    #             shared_experts_out = [expert(x) for expert in self.shared_experts]
+    #         print("Shared Experts 部分 trace 已保存至 ./log_dir/shared_experts")
+        
+    #     shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
+
+    #     # 合并 moe 和 shared experts 部分的输出
+    #     return sparse_moe_out + shared_experts_out
+
+
     def forward(self, x):
-        # x shape 是 (b, s, hidden_dim)
-        # 首先过 moe 模型
+    # x 的形状为 (b, s, hidden_dim)
         with torch.no_grad():
+            # 1. 通过 moe 模型
             sparse_moe_out = self.moe_model(x)
-
-        # 针对的还是 x 的每一个
-        # 然后过 shared experts
-        with torch.no_grad():
-            shared_experts_out = [
-                expert(x) for expert in self.shared_experts
-            ]  # 每一个 expert 的输出 shape 是 (b, s, hidden_dim)
-
+        
+        # 2. 通过 shared experts
+        shared_experts_out = [expert(x) for expert in self.shared_experts]
         shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
-
-        # 把 sparse_moe_out 和 shared_experts_out 加起来
+    
+        # 合并 moe 和 shared experts 部分的输出
         return sparse_moe_out + shared_experts_out
+
+

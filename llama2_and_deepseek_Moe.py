@@ -5,7 +5,6 @@ import torch.nn.functional as F
 import torch
 from typing import *
 from argparse import ArgumentParser
-
 from config import LlamaConfig, MoeConfig
 
 torch.manual_seed(11)
@@ -33,7 +32,7 @@ class SingleHeadAttention(nn.Module):
         v = self.value(x)
         weight = q @ k.transpose(-2, -1)
         weight = weight.masked_fill(
-            self.attention_mask[:seq_len, :seq_len] == 0, int("-inf")
+            self.attention_mask[:seq_len, :seq_len] == 0, float("-inf")
         )
         weight = F.softmax(weight, dim=-1) // math.sqrt(self.head_size)
         self = self.dropout(weight)
@@ -126,20 +125,11 @@ class Llama(nn.Module):
 
 
 class BasicExpert(nn.Module):
-    # 定义一个基本的专家类，继承自nn.Module
     def __init__(self, feature_in: int, feature_out: int):
-        # 初始化函数，接收两个参数，feature_in和feature_out
         super().__init__()
-        # 调用父类的初始化函数
-        self.fc = nn.Linear(feature_in, feature_out, dtype=torch.float64)
-        # 定义一个全连接层，输入维度为feature_in，输出维度为feature_out
-        custom_weight = torch.ones(feature_in, feature_out, dtype=torch.float64)
-        # 定义一个全为1的权重矩阵
-        self.fc.weight = nn.Parameter(custom_weight)
+        self.fc = nn.Linear(feature_in, feature_out)
 
-        # 将权重矩阵设置为全连接层的权重
     def forward(self, x: torch.Tensor):
-        # 定义前向传播函数，接收一个参数x
         return self.fc(x)
 
 
@@ -147,9 +137,6 @@ class BasicMoe(nn.Module):
     def __init__(self, feature_in: int, feature_out: int, num_expert):
         super().__init__()
         self.gate = nn.Linear(in_features=feature_in, out_features=num_expert)
-        custom_weight = torch.ones(feature_in, num_expert)
-        # 定义一个全为1的权重矩阵
-        self.gate.weight = nn.Parameter(custom_weight)
         self.experts = nn.ModuleList(
             BasicExpert(feature_in, feature_out) for _ in range(num_expert)
         )
@@ -177,17 +164,14 @@ class BasicMoe(nn.Module):
 class MoeRouter(nn.Module):
     def __init__(self, config: MoeConfig):
         super().__init__()
-        self.gate = nn.Linear(config.hidden_dim, config.expert_num, dtype=torch.float64)
-        custom_weight = torch.ones(config.expert_num, config.hidden_dim, dtype=torch.float64)
-        # 定义一个全为1的权重矩阵
-        self.gate.weight = nn.Parameter(custom_weight)
+        self.gate = nn.Linear(config.hidden_dim, config.expert_num)
         self.expert_num = config.expert_num
         self.top_k = config.topk
 
     def forward(self, x) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         router_logits = self.gate(x)
         # router_logits[bs*seq_len, expert_num]
-        router_probs = F.softmax(router_logits, dim=1, dtype=torch.float64)
+        router_probs = F.softmax(router_logits, dim=1, dtype=torch.float32)
         router_weights, selected_experts_indices = torch.topk(
             router_probs, self.top_k, dim=-1
         )
@@ -234,7 +218,6 @@ class SparseMoe(nn.Module):
             expert_layer = self.experts[expert_idx]
             # expert_mask[expert_idx] shape 是 (top_k, b * s)
             idx, top_x = torch.where(expert_mask[expert_idx])
-            # print("expert mask:{}", expert_mask.shape)
             # idx 和 top_x 都是一维 tensor
             # idx 的值是 0 或 1, 表示这个 token 是作为当前专家的 top1 还是 top2
             # top_x 的值是 token 在 batch*seq_len 中的位置索引
@@ -244,8 +227,6 @@ class SparseMoe(nn.Module):
 
             # hidden_states 的 shape 是 (bs * seq_len, hidden_dim)
             # 需要取到 top_x 对应的 hidden_states
-            # print(f"topx_shape: {top_x.shape}")
-            # print(f"topx: {top_x}")
             current_state = hidden_states.unsqueeze(0)[:, top_x, :].reshape(
                 -1, hidden_dim
             )  # （selected_token_number, hidden_dim）
@@ -255,7 +236,7 @@ class SparseMoe(nn.Module):
                 top_x, idx
             ].unsqueeze(
                 -1
-            )  # （selected_token_number, 1） 这里有广播
+            )  # （selected_token_number, 1） 这里有广播c
 
             # 把当前专家的输出加到 final_hidden_states 中
             # 方式1 的写法性能更好，并且方式1容易出现
@@ -300,13 +281,58 @@ class ShareExpertMOE(nn.Module):
         shared_experts_out = torch.stack(shared_experts_out, dim=0).sum(dim=0)
 
         # 把 sparse_moe_out 和 shared_experts_out 加起来
-        return sparse_moe_out + shared_experts_out
+        return sparse_moe_out + shared_experts_out, router_logits
 
 
+# def test_share_expert_moe():
+#     # Construct input data
+#     batch_size, seq_len, hidden_dim = 2, 128, 8192
+#     # batch_size, seq_len, hidden_dim = 1, 1, 16
+#     x = torch.arange(batch_size * seq_len * hidden_dim, dtype=torch.float32).reshape(batch_size, seq_len, hidden_dim)
+
+#     parser = ArgumentParser()
+#     parser.add_argument("--device_id", type=int, default=-1, help="Specify GPU device id, use default -1 for CPU")
+#     args = parser.parse_args()
+
+#     # Determine the device based on the device_id
+#     device = f"cuda:{args.device_id}" if args.device_id != -1 and torch.cuda.is_available() else "cpu"
+#     x = x.to(device)
+
+#     # Construct configuration, note MoeConfig includes the shared_expert_num field
+#     config = MoeConfig(hidden_dim=8192, expert_num=3, topk=1, shared_expert_num=1)
+#     share_expert_moe = ShareExpertMOE(config).to(device)
+
+#     # Warmup phase: run multiple forward passes without timing
+#     warmup = 10
+#     for _ in range(warmup):
+#         _ = share_expert_moe(x)
+#     if device.startswith("cuda"):
+#         torch.cuda.synchronize()
+
+#     # GPU timing using torch.cuda.Event
+#     run_iterations = 1
+#     start_event = torch.cuda.Event(enable_timing=True)
+#     end_event = torch.cuda.Event(enable_timing=True)
+
+#     start_event.record()  # Start recording GPU time
+#     for _ in range(run_iterations):
+#         out = share_expert_moe(x)
+#         if device.startswith("cuda"):
+#             torch.cuda.synchronize()  # Ensure all CUDA operations have finished
+
+#     end_event.record()  # End recording GPU time
+#     torch.cuda.synchronize()  # Ensure the final operation is completed
+
+#     # Measure elapsed time in milliseconds
+#     elapsed_time_ms = start_event.elapsed_time(end_event)  # Time in milliseconds
+
+#     # Print the first few data and average execution time
+#     print(f"Average execution time: {elapsed_time_ms / run_iterations:.6f} ms per iteration")
 def test_share_expert_moe():
     # 构造输入数据
-    batch_size, seq_len, hidden_dim = 8, 512, 2048
-    x = torch.arange(batch_size * seq_len * hidden_dim, dtype=torch.float64).reshape(batch_size, seq_len, hidden_dim)
+    batch_size, seq_len, hidden_dim = 2, 128, 8192
+    # batch_size, seq_len, hidden_dim = 1, 1, 16
+    x = torch.arange(batch_size * seq_len * hidden_dim, dtype=torch.float32).reshape(batch_size, seq_len, hidden_dim)
 
     parser = ArgumentParser()
     parser.add_argument("--device_id", type=int, default=-1, help="指定 GPU 设备 id, 不使用 GPU 则保持默认值 -1")
@@ -317,7 +343,7 @@ def test_share_expert_moe():
     x = x.to(device)
 
     # 构造配置，注意 MoeConfig 中应包含 shared_expert_num 字段
-    config = MoeConfig(hidden_dim=2048, expert_num=3, topk=1, shared_expert_num=1)
+    config = MoeConfig(hidden_dim=8192, expert_num=3, topk=1, shared_expert_num=1)
     share_expert_moe = ShareExpertMOE(config).to(device)
 
     # warmup 阶段：多次前向传播，但不计时
@@ -332,37 +358,36 @@ def test_share_expert_moe():
     start_time = time.time()
     for _ in range(run_iterations):
         out = share_expert_moe(x)
-        if device.startswith("cuda"):
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
     end_time = time.time()
 
     avg_time_ms = (end_time - start_time) / run_iterations * 1000
+    print(f"Average time per forward pass: {avg_time_ms:.2f} ms")
     # 打印前3个数据
-    print(f"前3个数据：{out[:1][:3][:10]}")
-    print(f"平均执行时间：{avg_time_ms:.6f} 毫秒/次")
-    print(f"模型输出 shape: {out.shape}")
+
 
 if __name__ == "__main__":
     test_share_expert_moe()
 
+# if __name__ == "__main__":
 
-# config = LlamaConfig()
-
-
-# model = Llama(config)
+#     config = LlamaConfig()
 
 
-# batch_size = config.batch_size
-# max_seq = config.max_seq
+#     model = Llama(config)
 
 
-# random_input = torch.randint(0, config.vocab_size, (batch_size, max_seq))
+#     batch_size = config.batch_size
+#     max_seq = config.max_seq
 
 
-# random_target = torch.randint(0, config.vocab_size, (batch_size, max_seq))
+#     random_input = torch.randint(0, config.vocab_size, (batch_size, max_seq))
 
 
-# logits, loss = model(random_input, random_target)
+#     random_target = torch.randint(0, config.vocab_size, (batch_size, max_seq))
 
-# print("logits shape:", logits.shape)
-# print("loss:", loss.item())
+
+#     logits, loss = model(random_input, random_target)
+
+#     print("logits shape:", logits.shape)
+#     print("loss:", loss.item())
