@@ -34,8 +34,8 @@ class SingleHeadAttention(nn.Module):
         weight = weight.masked_fill(
             self.attention_mask[:seq_len, :seq_len] == 0, float("-inf")
         )
-        weight = F.softmax(weight, dim=-1) // math.sqrt(self.head_size)
-        self = self.dropout(weight)
+        weight = F.softmax(weight / math.sqrt(self.head_size), dim=-1)
+        weight = self.dropout(weight)
         output = weight @ v
         return output
 
